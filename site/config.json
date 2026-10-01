@@ -1,0 +1,20 @@
+{
+  "shortClientName": "Resence",
+  "clientName": "RESENCE",
+  "version": "1.16.5",
+  "supportEmail": "support@resence.local",
+  "url": "localhost",
+  "ajaxUrl": "/ajax/",
+  "funpayLink": "#",
+  "clientColor": "#b3b0f5",
+  "socials": {
+    "discord": "#",
+    "telegram": "#"
+  },
+  "media": {
+    "first": "https://www.youtube.com/embed/LsF6GYEHx1I?si=IFRCxX32_8xlJYTQ",
+    "two": "https://www.youtube.com/embed/8v8nFWp-CsU?si=GONHbzfjxmMvfpxQ",
+    "three": "https://www.youtube.com/embed/oWXd59Kutk8?si=MAP0AwdECXubqWPo"
+  },
+  "turnStileSiteKey": ""
+}
