@@ -1,5 +1,6 @@
 /**
  * Cloudflare Worker with D1 Database + Static Assets (Single Fullstack Worker)
+ * Exclusivedlcsite Worker - Handles Auth, Admin, Keys, Promocodes, and Loaders
  */
 
 function jsonResponse(data, status = 200) {
@@ -46,6 +47,34 @@ function getFormattedDate() {
   const d = String(now.getDate()).padStart(2, "0");
   const m = String(now.getMonth() + 1).padStart(2, "0");
   const y = now.getFullYear();
+  return `${d}.${m}.${y}`;
+}
+
+function addDaysToDate(currentSubtill, daysToAdd) {
+  let baseDate = new Date();
+  if (currentSubtill && currentSubtill.toLowerCase() !== "none") {
+    try {
+      const parts = currentSubtill.split(".");
+      if (parts.length === 3) {
+        const d = parseInt(parts[0], 10);
+        const m = parseInt(parts[1], 10) - 1;
+        const y = parseInt(parts[2], 10);
+        const curExpiry = new Date(y, m, d, 23, 59, 59);
+        if (curExpiry.getTime() > baseDate.getTime()) {
+          baseDate = curExpiry;
+        }
+      }
+    } catch {}
+  }
+
+  if (daysToAdd >= 999 || daysToAdd >= 3650) {
+    return "31.12.2099";
+  }
+
+  baseDate.setDate(baseDate.getDate() + daysToAdd);
+  const d = String(baseDate.getDate()).padStart(2, "0");
+  const m = String(baseDate.getMonth() + 1).padStart(2, "0");
+  const y = baseDate.getFullYear();
   return `${d}.${m}.${y}`;
 }
 
@@ -111,6 +140,120 @@ export default {
 
     const db = env.DB;
 
+    // Helper: Password Hashing with SHA-256 + Salt
+    async function hashPassword(password) {
+      if (!password) return "";
+      const salt = "DeepSeek_Exclusive_Salt_2025_#99!";
+      const data = new TextEncoder().encode(password + salt);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    // Helper: Ensure all necessary DB tables exist
+    async function ensureAllTables() {
+      if (!db) return;
+      try {
+        await db.prepare(`CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE,
+          email TEXT UNIQUE,
+          password TEXT,
+          role TEXT DEFAULT 'USER',
+          banned INTEGER DEFAULT 0,
+          hwid TEXT,
+          subtill TEXT DEFAULT 'None',
+          regdate TEXT,
+          isEmailVerified INTEGER DEFAULT 1
+        )`).run();
+
+        try {
+          await db.prepare("ALTER TABLE users ADD COLUMN password TEXT").run();
+        } catch {}
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS tokens (
+          token TEXT PRIMARY KEY,
+          username TEXT
+        )`).run();
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          key TEXT UNIQUE,
+          display TEXT,
+          generatedBy TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`).run();
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS promocodes (
+          name TEXT PRIMARY KEY,
+          discount INTEGER DEFAULT 10,
+          activations INTEGER DEFAULT 0,
+          maxActivations INTEGER DEFAULT 100,
+          bet INTEGER DEFAULT 10,
+          maxUsages INTEGER DEFAULT 100
+        )`).run();
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS promocode_usages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          promocode TEXT,
+          username TEXT,
+          activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(promocode, username)
+        )`).run();
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS payloads (
+          version TEXT PRIMARY KEY,
+          payload_data TEXT NOT NULL,
+          entry_class TEXT NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`).run();
+
+        await db.prepare(`CREATE TABLE IF NOT EXISTS site_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )`).run();
+
+        try {
+          await db.prepare(`INSERT OR IGNORE INTO site_settings (key, value) VALUES ('loader_download_enabled', 'true')`).run();
+          await db.prepare(`INSERT OR IGNORE INTO site_settings (key, value) VALUES ('loader_download_url', '/downloads/Resence.exe')`).run();
+        } catch {}
+
+        try {
+          // If Maryjainer was assigned 889 due to SQLite max(id) jump, restore to sequential UID (20)
+          const mary = await db.prepare("SELECT * FROM users WHERE LOWER(username) = 'maryjainer' AND id = 889").first();
+          if (mary) {
+            const nextFree = await getNextRegularUid();
+            await db.prepare("UPDATE users SET id = ? WHERE id = 889").bind(nextFree).run();
+          }
+        } catch {}
+      } catch {}
+    }
+
+    // Helper: Calculate next sequential regular UID (skipping custom assigned IDs >= 500)
+    async function getNextRegularUid() {
+      if (!db) return 1;
+      try {
+        const { results } = await db.prepare("SELECT id FROM users ORDER BY id ASC").all();
+        if (!results || results.length === 0) return 1;
+        let maxNormal = 0;
+        const occupied = new Set();
+        for (const r of results) {
+          occupied.add(r.id);
+          if (r.id < 500 && r.id > maxNormal) {
+            maxNormal = r.id;
+          }
+        }
+        let candidate = maxNormal + 1;
+        while (occupied.has(candidate)) {
+          candidate++;
+        }
+        return candidate;
+      } catch {
+        return 1;
+      }
+    }
+
+    await ensureAllTables();
+
     // Helper: Get user by token
     async function getUserByToken(token) {
       if (!token || !db) return null;
@@ -133,6 +276,7 @@ export default {
       }
       return token;
     }
+
     // Helper: Subscription active check
     function isSubscriptionActive(subtill) {
       if (!subtill || subtill.toLowerCase() === "none") return false;
@@ -149,40 +293,29 @@ export default {
       return false;
     }
 
-    // Helper: Password Hashing with SHA-256 + Salt
-    async function hashPassword(password) {
-      if (!password) return "";
-      const salt = "DeepSeek_Exclusive_Salt_2025_#99!";
-      const data = new TextEncoder().encode(password + salt);
-      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-      return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
-    }
-
-    // Helper: Ensure users table has password column
-    async function ensureUsersTable() {
-      if (!db) return;
+    // Helper: Base64 encoding for file uploads
+    async function fileOrBufferToBase64(val) {
+      if (!val) return "";
+      if (typeof val === "string") return val;
       try {
-        await db.prepare("ALTER TABLE users ADD COLUMN password TEXT").run();
-      } catch {}
-    }
-
-    // Helper: Ensure payloads and settings tables exist
-    async function ensurePayloadsTable() {
-      if (!db) return;
-      try {
-        await db.prepare(
-          "CREATE TABLE IF NOT EXISTS payloads (version TEXT PRIMARY KEY, payload_data TEXT NOT NULL, entry_class TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-        ).run();
-
-        await db.prepare(
-          "CREATE TABLE IF NOT EXISTS site_settings (key TEXT PRIMARY KEY, value TEXT)"
-        ).run();
-
-        try {
-          await db.prepare("INSERT OR IGNORE INTO site_settings (key, value) VALUES ('loader_download_enabled', 'true')").run();
-          await db.prepare("INSERT OR IGNORE INTO site_settings (key, value) VALUES ('loader_download_url', '/downloads/ExclusiveDLC.exe')").run();
-        } catch {}
-      } catch {}
+        let ab;
+        if (typeof val.arrayBuffer === "function") {
+          ab = await val.arrayBuffer();
+        } else if (val instanceof ArrayBuffer) {
+          ab = val;
+        } else {
+          return String(val);
+        }
+        const bytes = new Uint8Array(ab);
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+      } catch {
+        return "";
+      }
     }
 
     // Helper: Base64 decode password if encoded by frontend (ir() function)
@@ -197,7 +330,6 @@ export default {
 
     // ==================== AUTH ENDPOINTS ====================
     if ((path === "/ajax/users/auth/default" || path === "/ajax/users/auth/login" || path === "/ajax/users/auth/signin") && method === "POST") {
-      await ensureUsersTable();
       const rawUser = (params.username || params.email || body.username || body.email || "").trim();
       const rawPass = (params.password || body.password || "").trim();
       const decodedPass = decodeBase64Pass(rawPass);
@@ -287,7 +419,6 @@ export default {
     }
 
     if (path === "/ajax/users/auth/register" && method === "POST") {
-      await ensureUsersTable();
       const rawUser = (params.username || body.username || "").trim();
       const rawEmail = (params.email || body.email || "").trim();
       const rawPass = (params.password || body.password || "").trim();
@@ -320,8 +451,9 @@ export default {
         }
 
         const regdate = getFormattedDate();
-        await db.prepare("INSERT INTO users (username, email, password, role, subtill, regdate) VALUES (?, ?, ?, ?, ?, ?)")
-          .bind(username, email, passHash, role, subtill, regdate).run();
+        const nextUid = await getNextRegularUid();
+        await db.prepare("INSERT INTO users (id, username, email, password, role, subtill, regdate) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .bind(nextUid, username, email, passHash, role, subtill, regdate).run();
         user = await db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)").bind(username).first();
       }
 
@@ -331,6 +463,46 @@ export default {
         authMessage: "Вы успешно зарегистрировались!",
         token,
       });
+    }
+
+    if (path === "/ajax/users/auth/changePassword" && method === "POST") {
+      const rawUser = (params.username || body.username || "").trim();
+      const oldPassRaw = (params.oldPassword || params.password || body.oldPassword || body.password || "").trim();
+      const newPassRaw = (params.newPassword || body.newPassword || "").trim();
+      const oldPass = decodeBase64Pass(oldPassRaw);
+      const newPass = decodeBase64Pass(newPassRaw);
+      const token = (params.token || body.token || "").trim();
+
+      if (!newPass || newPass.length < 4) {
+        return textResponse("Новый пароль должен содержать минимум 4 символа.", 400);
+      }
+
+      let user = null;
+      if (token) {
+        user = await getUserByToken(token);
+      } else if (rawUser) {
+        user = await db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)").bind(rawUser, rawUser).first();
+      }
+
+      if (!user) {
+        return textResponse("Пользователь не найден.", 404);
+      }
+
+      const isSuper = user.role === "ADMIN" || user.username.toLowerCase() === "dustgames";
+      if (!isSuper && user.password) {
+        const oldHash = await hashPassword(oldPass);
+        const oldHashRaw = await hashPassword(oldPassRaw);
+        if (user.password !== oldHash && user.password !== oldHashRaw) {
+          return textResponse("Текущий пароль указан неверно.", 400);
+        }
+      }
+
+      const newHash = await hashPassword(newPass);
+      if (db) {
+        await db.prepare("UPDATE users SET password = ? WHERE id = ?").bind(newHash, user.id).run();
+      }
+
+      return jsonResponse({ success: true, message: "Пароль успешно изменен!" });
     }
 
     if (path === "/ajax/users/auth/resetPassword" && method === "POST") {
@@ -380,6 +552,168 @@ export default {
 
     if (path === "/ajax/users/auth/2fa/initializePanelSession" && method === "POST") {
       return textResponse("OK");
+    }
+
+    if (path === "/ajax/users/auth/2fa/generate" && method === "POST") {
+      return jsonResponse({
+        qr: "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=otpauth://totp/Exclusive:DustGames?secret=JBSWY3DPEHPK3PXP",
+        code: "JBSWY3DPEHPK3PXP",
+      });
+    }
+
+    if (path === "/ajax/email/setup" && method === "POST") {
+      const token = params.token || body.token;
+      const email = (params.email || body.email || "").trim();
+      if (!email) return textResponse("Invalid mail", 400);
+      const user = await getUserByToken(token);
+      if (!user) return textResponse("Unauthorized", 401);
+      if (db) {
+        await db.prepare("UPDATE users SET email = ? WHERE LOWER(username) = LOWER(?)").bind(email, user.username).run();
+      }
+      return textResponse("Email успешно обновлен!");
+    }
+
+    if (path === "/ajax/user/subscriptions/getAdditionalSubscriptions") {
+      return jsonResponse([]);
+    }
+
+    // ==================== KEY & PROMOCODE ACTIVATION (CABINET) ====================
+    if ((path === "/ajax/users/actions/activateDigitalKey" || path.endsWith("/activateDigitalKey")) && (method === "POST" || method === "GET")) {
+      const token = params.token || body.token;
+      const rawKey = (params.key || body.key || params.code || body.code || "").trim();
+
+      if (!token) {
+        return textResponse("The entered key is invalid. (Unauthorized)", 401);
+      }
+
+      const user = await getUserByToken(token);
+      if (!user) {
+        return textResponse("The entered session has expired. Please log in again.", 401);
+      }
+
+      if (!rawKey) {
+        return textResponse("The entered key cannot be empty.", 400);
+      }
+
+      if (!db) {
+        return textResponse("Database connection unavailable.", 500);
+      }
+
+      const inputUpper = rawKey.toUpperCase();
+
+      // 1. Check if it's a Digital Key in `keys` table
+      let keyRow = null;
+      try {
+        keyRow = await db.prepare("SELECT * FROM keys WHERE UPPER(key) = ?").bind(inputUpper).first();
+      } catch {}
+
+      if (keyRow) {
+        const display = (keyRow.display || "").toLowerCase();
+        let message = "";
+
+        if (display.includes("hardware") || display.includes("hwid") || display.includes("reset")) {
+          const newHwid = "RESET-" + generateToken().slice(0, 8).toUpperCase();
+          await db.prepare("UPDATE users SET hwid = ? WHERE LOWER(username) = LOWER(?)").bind(newHwid, user.username).run();
+          message = "Привязка HWID успешно сброшена!";
+        } else if (display.includes("lifetime") || display.includes("forever") || display.includes("999")) {
+          const newSubtill = "31.12.2099";
+          const newRole = display.includes("beta") ? "BETA" : user.role;
+          await db.prepare("UPDATE users SET subtill = ?, role = ? WHERE LOWER(username) = LOWER(?)")
+            .bind(newSubtill, newRole, user.username).run();
+          message = "Активирована вечная подписка (LifeTime)!";
+        } else if (display === "beta" || (display.includes("beta") && !display.includes("day"))) {
+          await db.prepare("UPDATE users SET role = 'BETA' WHERE LOWER(username) = LOWER(?)").bind(user.username).run();
+          message = "Статус BETA успешно активирован!";
+        } else {
+          // Subscription key (e.g. "30 days", "60 days", "365 days")
+          let days = 30;
+          const matchDays = display.match(/(\d+)\s*days?/i);
+          if (matchDays) {
+            days = parseInt(matchDays[1], 10);
+          }
+          const newSubtill = addDaysToDate(user.subtill, days);
+          await db.prepare("UPDATE users SET subtill = ? WHERE LOWER(username) = LOWER(?)").bind(newSubtill, user.username).run();
+          message = `Ключ активирован! Подписка продлена до ${newSubtill}`;
+        }
+
+        // Delete used single-use key
+        try {
+          await db.prepare("DELETE FROM keys WHERE id = ?").bind(keyRow.id).run();
+        } catch {}
+        return textResponse(message);
+      }
+
+      // 2. Check if it's a Promocode in `promocodes` table
+      let promoRow = null;
+      try {
+        promoRow = await db.prepare("SELECT * FROM promocodes WHERE UPPER(name) = ?").bind(inputUpper).first();
+      } catch {}
+
+      if (promoRow) {
+        // Check if user already used this promocode
+        let usage = null;
+        try {
+          usage = await db.prepare("SELECT * FROM promocode_usages WHERE UPPER(promocode) = ? AND LOWER(username) = LOWER(?)")
+            .bind(inputUpper, user.username).first();
+        } catch {}
+
+        if (usage) {
+          return textResponse("The entered promo code has already been used on your account.", 400);
+        }
+
+        // Check activation limit
+        const maxAct = promoRow.maxActivations || promoRow.maxUsages || 0;
+        const curAct = promoRow.activations || 0;
+        if (maxAct > 0 && curAct >= maxAct) {
+          return textResponse("The entered promo code has reached its maximum activations limit.", 400);
+        }
+
+        let messageParts = [];
+
+        // Check if promocode resets HWID
+        if (inputUpper.includes("HWID") || inputUpper.includes("RESET")) {
+          const newHwid = "RESET-" + generateToken().slice(0, 8).toUpperCase();
+          await db.prepare("UPDATE users SET hwid = ? WHERE LOWER(username) = LOWER(?)").bind(newHwid, user.username).run();
+          messageParts.push("Сброс HWID выполнен");
+        }
+
+        // Check if promocode grants BETA
+        if (inputUpper.includes("BETA")) {
+          await db.prepare("UPDATE users SET role = 'BETA' WHERE LOWER(username) = LOWER(?)").bind(user.username).run();
+          messageParts.push("Статус BETA получен");
+        }
+
+        // Subscription days from bet / discount
+        let days = promoRow.bet || promoRow.discount || 0;
+        if (days <= 0 && !inputUpper.includes("HWID")) {
+          days = 30; // Default 30 days if standard promo
+        }
+
+        if (days > 0) {
+          const newSubtill = addDaysToDate(user.subtill, days);
+          await db.prepare("UPDATE users SET subtill = ? WHERE LOWER(username) = LOWER(?)").bind(newSubtill, user.username).run();
+          messageParts.push(`Подписка продлена до ${newSubtill}`);
+        }
+
+        // Record usage
+        try {
+          await db.prepare("INSERT INTO promocode_usages (promocode, username) VALUES (?, ?)").bind(inputUpper, user.username).run();
+        } catch {}
+
+        // Increment activations
+        try {
+          await db.prepare("UPDATE promocodes SET activations = activations + 1 WHERE UPPER(name) = ?").bind(inputUpper).run();
+        } catch {}
+
+        const resultMsg = messageParts.length > 0
+          ? `Промокод активирован! ${messageParts.join(", ")}`
+          : "Промокод успешно активирован!";
+
+        return textResponse(resultMsg);
+      }
+
+      // 3. Not found
+      return textResponse("The entered key or promo code does not exist.", 404);
     }
 
     // ==================== PAYMENTS ENDPOINTS ====================
@@ -443,7 +777,7 @@ export default {
 
       // Check if download is enabled globally
       let downloadEnabled = true;
-      let downloadUrl = "/downloads/ExclusiveDLC.exe";
+      let downloadUrl = "/downloads/Resence.exe";
       if (db) {
         try {
           const settingRow = await db.prepare("SELECT value FROM site_settings WHERE key = 'loader_download_enabled'").first();
@@ -464,19 +798,20 @@ export default {
           <html>
           <head>
             <meta charset="utf-8">
-            <title>Exclusive Client - Требуется авторизация</title>
+            <title>Resence Client - Требуется авторизация</title>
             <style>
               body { background: #0c0d14; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
               .card { background: #13141f; border: 1px solid #28293d; padding: 36px; border-radius: 16px; text-align: center; max-width: 440px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
               h2 { color: #ff4757; margin-top: 0; font-size: 22px; }
               p { color: #a4b0be; line-height: 1.6; font-size: 14px; margin-bottom: 24px; }
               a { display: inline-block; background: #6c5ce7; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 100px; font-weight: 600; font-size: 14px; transition: 0.2s; }
+              a:hover { background: #5b4cc4; }
             </style>
           </head>
           <body>
             <div class="card">
               <h2>Требуется авторизация</h2>
-              <p>Для скачивания лоадера Exclusive Client необходимо войти в свой аккаунт на сайте.</p>
+              <p>Для скачивания лоадера Resence Client необходимо войти в свой аккаунт на сайте.</p>
               <a href="/sign-in">Войти в аккаунт</a>
             </div>
           </body>
@@ -491,7 +826,7 @@ export default {
           <html>
           <head>
             <meta charset="utf-8">
-            <title>Exclusive Client - Скачивание отключено</title>
+            <title>Resence Client - Скачивание отключено</title>
             <style>
               body { background: #0c0d14; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
               .card { background: #13141f; border: 1px solid #28293d; padding: 36px; border-radius: 16px; text-align: center; max-width: 440px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
@@ -519,7 +854,7 @@ export default {
           <html>
           <head>
             <meta charset="utf-8">
-            <title>Exclusive Client - Требуется подписка</title>
+            <title>Resence Client - Требуется подписка</title>
             <style>
               body { background: #0c0d14; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
               .card { background: #13141f; border: 1px solid #28293d; padding: 36px; border-radius: 16px; text-align: center; max-width: 440px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
@@ -589,7 +924,7 @@ export default {
       }
 
       if (user.role !== "ADMIN" && !isSubscriptionActive(user.subtill)) {
-        return jsonResponse({ success: false, error: "Подписка не активна или истекла. Продлите на resencedlc.fun" }, 403);
+        return jsonResponse({ success: false, error: "Подписка не активна или истекла. Продлите на resence.fun" }, 403);
       }
 
       if (hwid) {
@@ -615,7 +950,6 @@ export default {
     }
 
     if (path === "/ajax/loader/payload" && method === "POST") {
-      await ensurePayloadsTable();
       const token = params.token || body.token;
       const hwid = (params.hwid || body.hwid || "").trim();
       const version = params.version || body.version || "1.21.11";
@@ -678,11 +1012,37 @@ export default {
         } catch {}
       }
 
+      if (version === "1.21.11") {
+        const payloadUrl = (payloadRow && (payloadRow.entry_class === "JAR_URL" || payloadRow.payload_data.startsWith("http")))
+          ? payloadRow.payload_data
+          : "https://github.com/DustGames0-1111/ezxofkdsflgsd/releases/download/v1.0.0/mods.zip";
+
+        return jsonResponse({
+          success: true,
+          version: "1.21.11",
+          entryClass: "ru.exclusive.client.Main",
+          url: payloadUrl,
+          isUrl: true,
+          updatedAt: payloadRow ? payloadRow.updated_at : new Date().toISOString(),
+        });
+      }
+
       if (!payloadRow) {
         return jsonResponse({
           success: false,
           error: `Байткод чита для версии ${version} еще не загружен на сервер Cloudflare.`,
         }, 404);
+      }
+
+      if (payloadRow.entry_class === "JAR_URL" || payloadRow.payload_data.startsWith("http")) {
+        return jsonResponse({
+          success: true,
+          version: payloadRow.version,
+          entryClass: "ru.exclusive.client.Main",
+          url: payloadRow.payload_data,
+          isUrl: true,
+          updatedAt: payloadRow.updated_at,
+        });
       }
 
       return jsonResponse({
@@ -694,63 +1054,106 @@ export default {
       });
     }
 
+    if (path === "/ajax/loader/gameZip" || path === "/ajax/loader/downloadGameZip" || path.endsWith("/loader/gameZip") || path.endsWith("/loader/downloadGameZip")) {
+      const version = params.version || body.version || "1.21.11";
+      const DEFAULT_GAME_ZIP_URL = "https://github.com/DustGames0-1111/ezxofkdsflgsd/releases/download/v1.0.0/game.zip";
+      let row = null;
+      if (db) {
+        try {
+          row = await db.prepare("SELECT * FROM payloads WHERE version = ?").bind(`${version}_game_zip`).first();
+        } catch {}
+      }
+      if (!row) {
+        if (version === "1.21.11") {
+          return jsonResponse({
+            success: true,
+            version: "1.21.11_game_zip",
+            url: DEFAULT_GAME_ZIP_URL,
+            isUrl: true,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        return jsonResponse({ success: false, error: `Архив game.zip для версии ${version} еще не загружен на сервер.` }, 404);
+      }
+      if (row.entry_class === "GAME_ZIP_URL") {
+        return jsonResponse({
+          success: true,
+          version: row.version,
+          url: row.payload_data,
+          isUrl: true,
+          updatedAt: row.updated_at,
+        });
+      }
+      return jsonResponse({
+        success: true,
+        version: row.version,
+        payload: row.payload_data,
+        isUrl: false,
+        updatedAt: row.updated_at,
+      });
+    }
+
     // ==================== ADMIN & DASHBOARD ====================
     if (path.startsWith("/ajax/admin/") || path.startsWith("/ajax/friends/")) {
       const token = params.token || body.token;
       const user = await getUserByToken(token);
 
-      if (path.endsWith("/isSessionInitialized")) {
-        return textResponse(user && user.role === "ADMIN" ? "true" : "false");
+      // getBanks is public in panel
+      if (!user && path.endsWith("/finances/getBanks")) {
+        return jsonResponse([
+          { enumName: "TINKOFF", displayName: "Тинькофф Банк (Т-Банк)" },
+          { enumName: "SBERBANK", displayName: "Сбербанк" },
+          { enumName: "ALFABANK", displayName: "Альфа-Банк" },
+        ]);
       }
 
-      // Block non-admins
-      if (!user || user.role !== "ADMIN") {
-        return jsonResponse({ error: "Access denied. Admins only.", content: [], total: 0 }, 403);
+      if (!user) {
+        return textResponse("Unauthorized", 401);
       }
 
-      if (path.endsWith("/finances/getBanks")) {
+      // session check
+      if (path.endsWith("/states/isSessionInitialized")) {
+        return textResponse("true");
+      }
+
+      // users list & search (paginated, 9 users per page)
+      if (path.endsWith("/users/getAll") || path.endsWith("/users/search")) {
+        const q = (params.query || "").toLowerCase().trim();
+        const page = Math.max(0, parseInt(params.page || body.page || "0", 10));
+        const pageSize = 9;
+
+        let allRows = [];
+        if (db) {
+          try {
+            const { results } = await db.prepare("SELECT * FROM users ORDER BY id DESC").all();
+            for (const u of results) {
+              if (q && !u.username.toLowerCase().includes(q) && !(u.email || "").toLowerCase().includes(q)) {
+                continue;
+              }
+              allRows.push({
+                uid: u.id,
+                user: u.username,
+                email: u.email,
+                group: u.role,
+                banned: Boolean(u.banned),
+                hwid: u.hwid,
+                subtill: u.subtill,
+              });
+            }
+          } catch {}
+        }
+
+        const totalPages = Math.max(1, Math.ceil(allRows.length / pageSize));
+        const pagedContent = allRows.slice(page * pageSize, (page + 1) * pageSize);
+
         return jsonResponse({
-          sber: { name: "Sberbank", id: "sber" },
-          tinkoff: { name: "Tinkoff", id: "tinkoff" },
-          alfa: { name: "Alfa-Bank", id: "alfa" },
+          content: pagedContent,
+          total: totalPages,
         });
       }
 
-      if (path.endsWith("/finances/getBalance")) return jsonResponse({ result: 0 });
-
-      if (path.endsWith("/finances/getWithdraws")) {
-        let withdrawsList = [];
-        if (db) {
-          try {
-            const { results } = await db.prepare("SELECT * FROM withdraws ORDER BY id DESC").all();
-            withdrawsList = results;
-          } catch {}
-        }
-        return jsonResponse(withdrawsList);
-      }
-
-      if (path.endsWith("/users/getAll") || path.endsWith("/users/search")) {
-        let usersList = [];
-        if (db) {
-          try {
-            const { results } = await db.prepare("SELECT * FROM users ORDER BY id ASC").all();
-            usersList = results.map((u) => ({
-              uid: u.id,
-              user: u.username,
-              email: u.email,
-              group: u.role,
-              banned: Boolean(u.banned),
-              hwid: u.hwid,
-              subtill: u.subtill,
-              regdate: (!u.regdate || u.regdate === "01.01.2024") ? getFormattedDate() : u.regdate,
-            }));
-          } catch {}
-        }
-        return jsonResponse({ content: usersList, total: Math.ceil(usersList.length / 10) || 1 });
-      }
-
       if (path.endsWith("/users/getByIdentifier")) {
-        const uid = parseInt(params.id || body.id || "1");
+        const uid = parseInt(params.id || body.id || "1", 10);
         let u = null;
         if (db) {
           u = await db.prepare("SELECT * FROM users WHERE id = ?").bind(uid).first();
@@ -851,7 +1254,7 @@ export default {
       // ==================== ADMIN SETTINGS ENDPOINTS ====================
       if (path.endsWith("/settings/get") || path.endsWith("/settings/getAll")) {
         let downloadEnabled = true;
-        let downloadUrl = "/downloads/ExclusiveDLC.exe";
+        let downloadUrl = "/downloads/Resence.exe";
         if (db) {
           try {
             const row1 = await db.prepare("SELECT value FROM site_settings WHERE key = 'loader_download_enabled'").first();
@@ -887,6 +1290,7 @@ export default {
         return jsonResponse({ success: true, message: "Настройки успешно сохранены!" });
       }
 
+      // Keys endpoints
       if (path.endsWith("/keys/action/getAll")) {
         let keysList = [];
         if (db) {
@@ -916,16 +1320,20 @@ export default {
       }
 
       if (path.includes("/multiactions/keys/")) {
-        const count = Math.min(Math.max(parseInt(params.count || body.count || "1"), 1), 50);
+        const count = Math.min(Math.max(parseInt(params.count || body.count || "1", 10), 1), 50);
         const days = params.days || body.days || "";
         let display = "Custom";
-        if (path.endsWith("/subscription")) display = days ? `${days} days` : "Subscription";
+        if (path.endsWith("/subscription")) display = days ? `${days} days` : "30 days";
         else if (path.endsWith("/hardwareReset")) display = "Hardware Reset";
         else if (path.endsWith("/beta")) display = "BETA";
+        else if (path.endsWith("/additionalProduct")) {
+          const prodId = params.productId || body.productId;
+          display = (prodId == "102") ? "BETA 1.21.11 + LifeTime" : "BETA 1.21.11";
+        }
 
         const createdKeys = [];
         for (let i = 0; i < count; i++) {
-          const k = "DUSTGAMES-" + generateToken().slice(0, 16).toUpperCase();
+          const k = "EXCLUSIVE-" + generateToken().slice(0, 16).toUpperCase();
           createdKeys.push(k);
           if (db) {
             try {
@@ -936,6 +1344,7 @@ export default {
         return textResponse(createdKeys.join("\n"));
       }
 
+      // Promocodes endpoints
       if (path.endsWith("/promocodes/getAll")) {
         let promoMap = {};
         if (db) {
@@ -949,30 +1358,153 @@ export default {
         return jsonResponse(promoMap);
       }
 
+      if (path.endsWith("/promocodes/get")) {
+        const name = (params.promocode || body.promocode || "").trim().toUpperCase();
+        let row = null;
+        if (db && name) {
+          try {
+            row = await db.prepare("SELECT * FROM promocodes WHERE UPPER(name) = ?").bind(name).first();
+          } catch {}
+        }
+        if (!row) {
+          row = { name, discount: 0, activations: 0, maxActivations: 0, bet: 0, maxUsages: 0 };
+        }
+        return jsonResponse(row);
+      }
+
       if (path.endsWith("/promocodes/create")) {
-        const name = (params.promocode || body.promocode || "PROMO").toUpperCase();
-        const bet = parseInt(params.bet || body.bet || "10");
-        const max_u = parseInt(params.maxUsages || body.maxUsages || "100");
-        if (db) {
-          await db.prepare("INSERT OR REPLACE INTO promocodes (name, discount, activations, maxActivations, bet, maxUsages) VALUES (?, ?, 0, ?, ?, ?)")
-            .bind(name, bet, max_u, bet, max_u).run();
+        const name = (params.promocode || body.promocode || "PROMO").trim().toUpperCase();
+        const bet = parseInt(params.bet || body.bet || "10", 10);
+        const max_u = parseInt(params.maxUsages || body.maxUsages || "100", 10);
+        if (db && name) {
+          try {
+            await db.prepare(
+              "INSERT INTO promocodes (name, discount, activations, maxActivations, bet, maxUsages) VALUES (?, ?, 0, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET discount = ?, maxActivations = ?, bet = ?, maxUsages = ?"
+            ).bind(name, bet, max_u, bet, max_u, bet, max_u, bet, max_u).run();
+          } catch {
+            await db.prepare(
+              "INSERT OR REPLACE INTO promocodes (name, discount, activations, maxActivations, bet, maxUsages) VALUES (?, ?, 0, ?, ?, ?)"
+            ).bind(name, bet, max_u, bet, max_u).run();
+          }
         }
         return textResponse("Promocode created");
       }
 
+      if (path.endsWith("/promocodes/patch")) {
+        const name = (params.promocode || body.promocode || "").trim().toUpperCase();
+        if (db && name) {
+          const bet = parseInt(params.bet || body.bet || "10", 10);
+          const max_u = parseInt(params.maxUsages || body.maxUsages || "100", 10);
+          await db.prepare(
+            "UPDATE promocodes SET discount = ?, bet = ?, maxActivations = ?, maxUsages = ? WHERE UPPER(name) = ?"
+          ).bind(bet, bet, max_u, max_u, name).run();
+        }
+        return textResponse("Promocode updated");
+      }
+
       if (path.endsWith("/promocodes/delete")) {
-        const name = (params.promocode || body.promocode || "").toUpperCase();
+        const name = (params.promocode || body.promocode || "").trim().toUpperCase();
         if (db && name) {
           await db.prepare("DELETE FROM promocodes WHERE UPPER(name) = ?").bind(name).run();
+          try {
+            await db.prepare("DELETE FROM promocode_usages WHERE UPPER(promocode) = ?").bind(name).run();
+          } catch {}
         }
         return textResponse("Promocode deleted");
       }
 
+      if (path.endsWith("/promocodes/resetUsages")) {
+        const name = (params.promocode || body.promocode || "").trim().toUpperCase();
+        if (db && name) {
+          await db.prepare("UPDATE promocodes SET activations = 0 WHERE UPPER(name) = ?").bind(name).run();
+          try {
+            await db.prepare("DELETE FROM promocode_usages WHERE UPPER(promocode) = ?").bind(name).run();
+          } catch {}
+        }
+        return textResponse("Usages reset");
+      }
+
+      if (path.endsWith("/promocodes/statistic/get")) {
+        return jsonResponse({ payments: [], total: 0 });
+      }
+
+      if (path.endsWith("/promocodes/statistic/clearPayments")) {
+        return textResponse("Statistics cleared");
+      }
+
       if (path.endsWith("/autoload/getVersions")) {
         return jsonResponse({
-          "1.16.5": { display: "1.16.5", identify: "1.16.5" },
           "1.21.11": { display: "1.21.11 BETA", identify: "1.21.11" },
         });
+      }
+
+      if (path.endsWith("/autoload/uploadVersion") && method === "POST") {
+        const version = (params.version || body.version || "1.21.11").trim();
+        const jarFile = body.jar || params.jar;
+        const zipFile = body.zip || body.file || params.zip || params.file;
+        const zipUrl = (params.zipUrl || body.zipUrl || params.url || body.url || "").trim();
+        const isGameZip = (body.type === "game_zip" || params.type === "game_zip" || Boolean(zipUrl) || (zipFile && !jarFile) || (zipFile && String(zipFile.name || "").endsWith(".zip")));
+
+        if (isGameZip) {
+          if (zipUrl) {
+            if (db) {
+              await db.prepare(
+                "INSERT OR REPLACE INTO payloads (version, payload_data, entry_class, updated_at) VALUES (?, ?, 'GAME_ZIP_URL', CURRENT_TIMESTAMP)"
+              ).bind(`${version}_game_zip`, zipUrl).run();
+            }
+            return textResponse(`Прямая ссылка на game.zip (${version}) успешно сохранена!`);
+          }
+
+          const targetFile = zipFile || jarFile;
+          let payloadB64 = await fileOrBufferToBase64(targetFile);
+          if (!payloadB64) {
+            payloadB64 = (params.payload || body.payload || params.payload_data || body.payload_data || "").trim();
+          }
+
+          if (!payloadB64) {
+            return textResponse("Ошибка: Файл game.zip не был получен.", 400);
+          }
+
+          if (db) {
+            try {
+              await db.prepare(
+                "INSERT OR REPLACE INTO payloads (version, payload_data, entry_class, updated_at) VALUES (?, ?, 'GAME_ZIP_ARCHIVE', CURRENT_TIMESTAMP)"
+              ).bind(`${version}_game_zip`, payloadB64).run();
+            } catch (err) {
+              return textResponse(`Ошибка базы Cloudflare: размер файла превышает лимит SQL (${Math.round(payloadB64.length / 1024 / 1024)} MB). Рекомендуется указать прямую ссылку на скачивание game.zip через поле Direct URL.`, 400);
+            }
+          }
+
+          return textResponse(`Архив игры game.zip (${version}) успешно сохранен на сервере! (${Math.round(payloadB64.length * 0.75 / 1024)} KB)`);
+        }
+
+        const jarUrl = (params.jarUrl || body.jarUrl || (!isGameZip && (body.url || params.url)) || "").trim();
+        if (jarUrl) {
+          if (db) {
+            await db.prepare(
+              "INSERT OR REPLACE INTO payloads (version, payload_data, entry_class, updated_at) VALUES (?, ?, 'JAR_URL', CURRENT_TIMESTAMP)"
+            ).bind(version, jarUrl).run();
+          }
+          return textResponse(`Прямая ссылка на мод .jar (${version}) успешно сохранена!`);
+        }
+
+        // Mod JAR upload
+        let payloadB64 = await fileOrBufferToBase64(jarFile);
+        if (!payloadB64) {
+          payloadB64 = (params.payload || body.payload || params.payload_data || body.payload_data || "").trim();
+        }
+
+        if (!payloadB64) {
+          return textResponse("Ошибка: Файл .jar не был получен.", 400);
+        }
+
+        if (db) {
+          await db.prepare(
+            "INSERT OR REPLACE INTO payloads (version, payload_data, entry_class, updated_at) VALUES (?, ?, 'ru.exclusive.client.Main', CURRENT_TIMESTAMP)"
+          ).bind(version, payloadB64).run();
+        }
+
+        return textResponse(`Мод для версии ${version} успешно загружен на сервер! (${Math.round(payloadB64.length * 0.75 / 1024)} KB)`);
       }
 
       if (path.endsWith("/media/getVideo")) {
@@ -989,9 +1521,8 @@ export default {
       }
 
       if (path.endsWith("/loader/uploadPayload") && method === "POST") {
-        await ensurePayloadsTable();
         const version = (params.version || body.version || "1.21.11").trim();
-        const entryClass = (params.entry_class || params.entryClass || body.entry_class || body.entryClass || "ru.resence.client.Main").trim();
+        const entryClass = (params.entry_class || params.entryClass || body.entry_class || body.entryClass || "ru.exclusive.client.Main").trim();
         const payloadData = (params.payload || body.payload || params.payload_data || body.payload_data || "").trim();
 
         if (!payloadData) {
@@ -1014,7 +1545,6 @@ export default {
       }
 
       if (path.endsWith("/loader/listPayloads")) {
-        await ensurePayloadsTable();
         let list = [];
         if (db) {
           try {
@@ -1026,7 +1556,6 @@ export default {
       }
 
       if (path.endsWith("/loader/deletePayload") && method === "POST") {
-        await ensurePayloadsTable();
         const version = (params.version || body.version || "").trim();
         if (db && version) {
           await db.prepare("DELETE FROM payloads WHERE version = ?").bind(version).run();
