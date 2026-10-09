@@ -136,6 +136,23 @@ export default {
       return false;
     }
 
+    // Helper: Password Hashing with SHA-256 + Salt
+    async function hashPassword(password) {
+      if (!password) return "";
+      const salt = "DeepSeek_Exclusive_Salt_2025_#99!";
+      const data = new TextEncoder().encode(password + salt);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    // Helper: Ensure users table has password column
+    async function ensureUsersTable() {
+      if (!db) return;
+      try {
+        await db.prepare("ALTER TABLE users ADD COLUMN password TEXT").run();
+      } catch {}
+    }
+
     // Helper: Ensure payloads table exists
     async function ensurePayloadsTable() {
       if (!db) return;
@@ -148,12 +165,19 @@ export default {
 
     // ==================== AUTH ENDPOINTS ====================
     if ((path === "/ajax/users/auth/default" || path === "/ajax/users/auth/login" || path === "/ajax/users/auth/signin") && method === "POST") {
+      await ensureUsersTable();
       const rawUser = (params.username || params.email || body.username || body.email || "").trim();
+      const rawPass = (params.password || body.password || "").trim();
+
       if (!rawUser) {
         return textResponse("Введите логин или почту.", 400);
       }
+      if (!rawPass) {
+        return textResponse("Введите пароль.", 400);
+      }
 
       const isSuperAdmin = rawUser.toLowerCase() === "dustgames" || rawUser.toLowerCase() === "nikiforova280987@gmail.com";
+      const passHash = await hashPassword(rawPass);
       
       let user = null;
       if (db) {
@@ -168,16 +192,17 @@ export default {
           const username = "DustGames";
           const role = "ADMIN";
           const subtill = "31.12.2099";
+          const regdate = getFormattedDate();
           if (db) {
-            const regdate = getFormattedDate();
-          await db.prepare("INSERT INTO users (username, email, role, subtill, regdate) VALUES (?, ?, ?, ?, ?)")
-            .bind(username, email, role, subtill, regdate).run();
+            await db.prepare("INSERT INTO users (username, email, password, role, subtill, regdate) VALUES (?, ?, ?, ?, ?, ?)")
+              .bind(username, email, passHash, role, subtill, regdate).run();
             user = await db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)").bind(username).first();
           } else {
             user = {
               id: 1,
               username,
               email,
+              password: passHash,
               isEmailVerified: 1,
               role,
               banned: 0,
@@ -195,6 +220,18 @@ export default {
         return textResponse("Ваш аккаунт заблокирован.", 403);
       }
 
+      // Verify password
+      if (user.password) {
+        if (user.password !== passHash) {
+          return textResponse("Неверный пароль. Проверьте правильность введенных данных.", 400);
+        }
+      } else {
+        // Legacy user with no password hash stored yet: save current password as their password hash
+        if (db) {
+          await db.prepare("UPDATE users SET password = ? WHERE id = ?").bind(passHash, user.id).run().catch(() => {});
+        }
+      }
+
       const token = await issueToken(user.username);
       return jsonResponse({
         authStatus: true,
@@ -204,10 +241,19 @@ export default {
     }
 
     if (path === "/ajax/users/auth/register" && method === "POST") {
+      await ensureUsersTable();
       const rawUser = (params.username || body.username || "").trim();
       const rawEmail = (params.email || body.email || "").trim();
+      const rawPass = (params.password || body.password || "").trim();
+
       if (!rawUser) {
         return textResponse("Введите имя пользователя.", 400);
+      }
+      if (!rawPass) {
+        return textResponse("Введите пароль.", 400);
+      }
+      if (rawPass.length < 4) {
+        return textResponse("Пароль должен содержать минимум 4 символа.", 400);
       }
 
       const isSuperAdmin = rawUser.toLowerCase() === "dustgames" || rawEmail.toLowerCase() === "nikiforova280987@gmail.com";
@@ -215,6 +261,7 @@ export default {
       const email = isSuperAdmin ? "nikiforova280987@gmail.com" : (rawEmail || `${username.toLowerCase()}@localhost`);
       const role = isSuperAdmin ? "ADMIN" : "USER";
       const subtill = isSuperAdmin ? "31.12.2099" : "None";
+      const passHash = await hashPassword(rawPass);
 
       let user = null;
       if (db) {
@@ -225,8 +272,8 @@ export default {
         }
 
         const regdate = getFormattedDate();
-        await db.prepare("INSERT INTO users (username, email, role, subtill, regdate) VALUES (?, ?, ?, ?, ?)")
-          .bind(username, email, role, subtill, regdate).run();
+        await db.prepare("INSERT INTO users (username, email, password, role, subtill, regdate) VALUES (?, ?, ?, ?, ?, ?)")
+          .bind(username, email, passHash, role, subtill, regdate).run();
         user = await db.prepare("SELECT * FROM users WHERE LOWER(username) = LOWER(?)").bind(username).first();
       }
 
